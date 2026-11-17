@@ -1,0 +1,177 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Torch spike</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 16px; min-height: 100dvh;
+    font: 16px/1.4 system-ui, sans-serif; background: #111; color: #eee;
+    display: flex; flex-direction: column; gap: 12px;
+  }
+  #toggle {
+    font: inherit; font-size: 28px; font-weight: 700;
+    padding: 40px 16px; border: 0; border-radius: 16px;
+    background: #333; color: #fff; touch-action: manipulation;
+  }
+  #toggle[aria-pressed="true"] { background: #ffd400; color: #000; }
+  #toggle:disabled { opacity: .5; }
+  #status { margin: 0; min-height: 1.4em; }
+  .row { display: flex; gap: 12px; align-items: center; }
+  video { width: 96px; height: 72px; background: #000; border-radius: 8px; object-fit: cover; }
+  .row button { font: inherit; padding: 10px 14px; border-radius: 8px; border: 1px solid #555; background: #222; color: #eee; }
+  pre {
+    flex: 1; margin: 0; padding: 10px; overflow: auto; min-height: 200px;
+    background: #000; border-radius: 8px; font-size: 12px; white-space: pre-wrap; word-break: break-word;
+  }
+</style>
+</head>
+<body>
+  <button id="toggle" aria-pressed="false">Flash ON</button>
+  <p id="status" role="status">Tap the button. Allow camera access when asked.</p>
+  <div class="row">
+    <!-- The track is kept attached to a playing <video>: some devices only drive the torch while the stream is being consumed. -->
+    <video id="preview" playsinline muted autoplay></video>
+    <button id="release">Release camera</button>
+    <button id="copy">Copy log</button>
+  </div>
+  <pre id="log" aria-label="Diagnostic log"></pre>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const toggleBtn = $('toggle'), statusEl = $('status'), video = $('preview'), logEl = $('log');
+
+let stream = null;   // the open camera stream
+let track = null;    // its video track, once we've found one with a torch
+let torchOn = false;
+
+function log(...parts) {
+  const line = parts.map((p) => (typeof p === 'string' ? p : JSON.stringify(p))).join(' ');
+  logEl.textContent += line + '\n';
+  logEl.scrollTop = logEl.scrollHeight;
+}
+const setStatus = (msg) => { statusEl.textContent = msg; log('» ' + msg); };
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+function closeCamera() {
+  if (stream) stream.getTracks().forEach((t) => t.stop());
+  stream = track = null;
+  video.srcObject = null;
+  torchOn = false;
+  render();
+}
+
+function render() {
+  toggleBtn.setAttribute('aria-pressed', String(torchOn));
+  toggleBtn.textContent = torchOn ? 'Flash OFF' : 'Flash ON';
+}
+
+// Open one camera and report whether its track exposes a torch.
+async function openCamera(videoConstraints) {
+  closeCamera(); // Android generally can't hold two cameras open at once
+  stream = await navigator.mediaDevices.getUserMedia({ video: videoConstraints, audio: false });
+  video.srcObject = stream;
+  await video.play().catch((e) => log('video.play() failed:', String(e)));
+  const t = stream.getVideoTracks()[0];
+
+  // Chrome on Android fills in capabilities asynchronously after the camera
+  // starts, so `torch` can be missing for the first few hundred ms. Poll for it.
+  let caps = {};
+  for (let i = 0; i < 20; i++) {
+    caps = t.getCapabilities ? t.getCapabilities() : {};
+    if ('torch' in caps) break;
+    await sleep(100);
+  }
+  log('camera:', t.label || '(no label)', '| torch capability:', 'torch' in caps ? caps.torch : 'absent',
+      '| facingMode:', caps.facingMode ?? '?');
+  return caps.torch ? t : null;
+}
+
+// Find a camera with a torch. Multi-lens phones (most Samsungs) expose several
+// rear cameras and only one of them is wired to the flash; `facingMode:
+// environment` often picks a different lens, so fall back to trying each one.
+async function findTorchTrack() {
+  let t = await openCamera({ facingMode: { ideal: 'environment' } });
+  if (t) return t;
+
+  const firstId = stream.getVideoTracks()[0].getSettings().deviceId;
+  const cams = (await navigator.mediaDevices.enumerateDevices()).filter((d) => d.kind === 'videoinput');
+  log(`default camera has no torch; trying ${cams.length - 1} other camera(s)`);
+  for (const cam of cams) {
+    if (cam.deviceId === firstId || /front|user|selfie/i.test(cam.label)) continue;
+    try {
+      t = await openCamera({ deviceId: { exact: cam.deviceId } });
+      if (t) return t;
+    } catch (e) {
+      log('could not open', cam.label || cam.deviceId, '-', String(e));
+    }
+  }
+  return null;
+}
+
+async function setTorch(on) {
+  if (on && !track) {
+    setStatus('Opening camera…');
+    track = await findTorchTrack();
+    if (!track) {
+      closeCamera();
+      setStatus('No camera on this device/browser exposes a torch. See log.');
+      return;
+    }
+  }
+  if (!track) return;
+
+  try {
+    await track.applyConstraints({ advanced: [{ torch: on }] });
+    const actual = track.getSettings().torch;
+    log(`applyConstraints(torch: ${on}) ok | settings.torch = ${actual}`);
+    torchOn = on;
+    // Some devices ignore torch:false; stopping the track always kills the light.
+    if (!on && actual === true) { log('torch still reported on; releasing camera'); closeCamera(); }
+    setStatus(on ? 'Flash should be ON.' : 'Flash OFF.');
+  } catch (e) {
+    log('applyConstraints failed:', String(e));
+    if (!on) closeCamera();
+    setStatus('Torch request was rejected. See log.');
+  }
+  render();
+}
+
+toggleBtn.addEventListener('click', async () => {
+  toggleBtn.disabled = true;
+  try {
+    await setTorch(!torchOn);
+  } catch (e) {
+    closeCamera();
+    setStatus(e.name === 'NotAllowedError' ? 'Camera permission denied.' : 'Failed: ' + e);
+  } finally {
+    toggleBtn.disabled = false;
+  }
+});
+
+$('release').addEventListener('click', () => { closeCamera(); setStatus('Camera released.'); });
+$('copy').addEventListener('click', () => navigator.clipboard.writeText(logEl.textContent).then(
+  () => setStatus('Log copied.'), () => setStatus('Copy failed; long-press the log to select it.')));
+
+// The browser cuts the camera (and the light) when the tab is backgrounded.
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden && stream) { closeCamera(); log('tab hidden: camera released'); }
+});
+
+// Environment report up front, so a failure is diagnosable from the log alone.
+log(navigator.userAgent);
+log('secure context:', window.isSecureContext,
+    '| mediaDevices:', !!navigator.mediaDevices,
+    '| browser knows `torch`:', !!navigator.mediaDevices?.getSupportedConstraints?.().torch);
+if (!window.isSecureContext || !navigator.mediaDevices) {
+  toggleBtn.disabled = true;
+  setStatus('Camera API unavailable: the page must be served over HTTPS (or localhost).');
+} else if (!navigator.mediaDevices.getSupportedConstraints().torch) {
+  setStatus('This browser does not support the torch constraint (try Chrome on Android).');
+}
+</script>
+</body>
+</html>
